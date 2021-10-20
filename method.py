@@ -8,8 +8,6 @@ from params import SlotAttentionParams
 from utils import Tensor
 from utils import to_rgb_from_tensor
 
-import matplotlib.pyplot as plt
-
 
 class SlotAttentionMethod(pl.LightningModule):
     def __init__(self, model: SlotAttentionModel, datamodule: pl.LightningDataModule, params: SlotAttentionParams):
@@ -26,35 +24,16 @@ class SlotAttentionMethod(pl.LightningModule):
         logs = {key: val.item() for key, val in train_loss.items()}
         self.log_dict(logs, sync_dist=True)
         return train_loss
-        
-    def si(self):
-        dl = self.datamodule.train_dataloader()
-        #perm = torch.randperm(self.params.batch_size)
-        #idx = perm[: self.params.n_samples]
-        for (idx, batch) in enumerate(dl):
-            print(idx)
-            print(batch.shape)
-
-    def magic_combine(self,x, dim_begin, dim_end):
-        combined_shape = list(x.shape[:dim_begin]) + [-1] + list(x.shape[dim_end:])
-        return x.view(combined_shape)
 
     def sample_images(self):
-        #dl = self.datamodule.val_dataloader()
-        dl = self.datamodule.train_dataloader()
+        dl = self.datamodule.val_dataloader()
         perm = torch.randperm(self.params.batch_size)
         idx = perm[: self.params.n_samples]
         batch = next(iter(dl))[idx]
         if self.params.gpus > 0:
             batch = batch.to(self.device)
         recon_combined, recons, masks, slots = self.model.forward(batch)
-        
-         
 
-        #print(batch.unsqueeze(1).shape)
-        #print(recon_combined.unsqueeze(1).shape)
-        #print((recons * masks + (1 - masks)).shape)
-        #
         # combine images in a nice way so we can display all outputs in one grid, output rescaled to be between 0 and 1
         out = to_rgb_from_tensor(
             torch.cat(
@@ -67,18 +46,10 @@ class SlotAttentionMethod(pl.LightningModule):
             )
         )
 
-        batch_size, num_slots, frames, C, H, W = recons.shape
-        print(out.shape)
-        out = out[0,:,:,:,:,:]
-        # recons_new = recons[:,:,-1,:,:,:]
-        #print("Here")
-        # print(recons_new.shape)
-        # out = out.permute(1,3,4,5,2,0)
-        # out = out.reshape(num_slots+2, C, H, W, -1)
-        # out = out.permute(4,0,1,2,3)
+        batch_size, num_slots, nFrames, C, H, W = recons.shape
         images = vutils.make_grid(
-            out.reshape(frames * out.shape[0], C, H, W).cpu(), normalize=False, nrow=out.shape[1],
-        )
+            out.view(nFrames * out.shape[1], C, H, W).cpu(), normalize=False, nrow=nFrames,
+        ) # Assuming nSamples is 1, or do out - out[0] and out.shape[0]
 
         return images
 
@@ -107,7 +78,6 @@ class SlotAttentionMethod(pl.LightningModule):
             assert step < total_steps
             if step < warmup_steps:
                 factor = step / warmup_steps
-                #factor *= self.params.scheduler_gamma ** (step / decay_steps)###
             else:
                 factor = 1
             factor *= self.params.scheduler_gamma ** (step / decay_steps)

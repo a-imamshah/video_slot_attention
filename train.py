@@ -29,23 +29,20 @@ def main(params: Optional[SlotAttentionParams] = None):
     clevr_transforms = transforms.Compose(
         [
             transforms.ToTensor(),
-            #transforms.Lambda(rescale),  # rescale between -1 and 1
-            #transforms.Resize(params.resolution),
+            transforms.Lambda(rescale),  # rescale between -1 and 1
+            transforms.Resize(params.resolution),
         ]
     )
 
     clevr_datamodule = CLEVRDataModule(
         data_root=params.data_root,
-        #max_n_objects=params.num_slots - 1,
+        max_n_objects=params.num_slots - 1,
         train_batch_size=params.batch_size,
         val_batch_size=params.val_batch_size,
         clevr_transforms=clevr_transforms,
         num_train_images=params.num_train_images,
         num_val_images=params.num_val_images,
         num_workers=params.num_workers,
-        n_steps=params.n_steps,
-        dataset_class=params.dataset_class,
-        T=params.T,
     )
 
     print(f"Training set size (images must have {params.num_slots - 1} objects):", len(clevr_datamodule.train_dataset))
@@ -58,13 +55,10 @@ def main(params: Optional[SlotAttentionParams] = None):
     )
 
     method = SlotAttentionMethod(model=model, datamodule=clevr_datamodule, params=params)
-    
-    #method.si()
 
     logger_name = "slot-attention-clevr6"
     logger = pl_loggers.WandbLogger(project="slot-attention-clevr6", name=logger_name)
-    
-    
+
     trainer = Trainer(
         logger=logger if params.is_logger_enabled else False,
         accelerator="ddp" if params.gpus > 1 else None,

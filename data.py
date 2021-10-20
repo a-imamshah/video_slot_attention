@@ -7,52 +7,51 @@ from typing import Tuple
 
 import pytorch_lightning as pl
 from PIL import Image
+import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 from torchvision.transforms import transforms
 
-import torch
-import torchvision
-import numpy as np
+from utils import compact
 
 
-class SyntheticDataset(Dataset):
-    def __init__(self,
+class CLEVRDataset(Dataset):
+    def __init__(
+        self,
         data_root: str,
         max_num_images: Optional[int],
         clevr_transforms: Callable,
-        split: str = "train", #mode
-        n_steps=10, 
-        dataset_class='spmot', 
-        T=0): #transforms, path
-
-        assert dataset_class in ['vmds', 'vor', 'spmot']
-        self.clevr_transforms = clevr_transforms
-        #self.split_dict = {"train":"train2017", "val":"val2017", "test":"test2017"}
+        max_n_objects: int = 10,
+        split: str = "train",
+    ):
+        super().__init__()
         self.data_root = data_root
+        self.clevr_transforms = clevr_transforms
+        self.max_num_images = max_num_images
+        self.data_path = os.path.join(data_root, "vor", split)
+        self.max_n_objects = max_n_objects
         self.split = split
-        
+        assert os.path.exists(self.data_root), f"Path {self.data_root} does not exist"
+        assert self.split == "train" or self.split == "val" or self.split == "test"
+        assert os.path.exists(self.data_path), f"Path {self.data_path} does not exist"
+        files = self.get_files()
+        nFrames = 10
+        self.files = [files[nFrames*i:nFrames*(i+1)] for i in range(len(files)//nFrames)]
 
-        
-        imgs = np.load(os.path.join(data_root, dataset_class, '{}_{}.npy'.format(dataset_class, split)))
-        imgs = imgs[:, :n_steps]
-        imgs = imgs[0:max_num_images,:,:,:,:]
-        if T and T < n_steps:
-            imgs = np.concatenate(np.split(imgs, imgs.shape[1]//T, axis=1))
-        self.imgs = imgs
-        #self.imgs = [img for img in imgs]
-        self.num_samples = self.imgs.shape[0]
-
-
-    def __getitem__(self, index):
-        x = self.imgs[index]
-        fr, ch, imx, imy = x.shape
-        x = torch.stack([transforms.ToTensor()(x[i]) for i in range(fr)])
-        x = x.permute(0,2,1,3)
-        return x.float()
+    def __getitem__(self, index: int):
+        image_paths = self.files[index]
+        imgs = [Image.open(image_path) for image_path in image_paths]
+        imgs = [img.convert("RGB") for img in imgs]
+        imgs = torch.stack([self.clevr_transforms(img) for img in imgs])
+        return imgs
 
     def __len__(self):
-        return self.num_samples
+        return len(self.files)
+
+    def get_files(self) -> List[str]:
+        paths = [f for f in os.listdir(self.data_path) if f.endswith(".jpg")]
+        paths = [os.path.join(self.data_root, "vor", self.split, f) for f in paths]
+        return sorted(compact(paths))
 
 
 class CLEVRDataModule(pl.LightningDataModule):
@@ -62,10 +61,8 @@ class CLEVRDataModule(pl.LightningDataModule):
         train_batch_size: int,
         val_batch_size: int,
         clevr_transforms: Callable,
+        max_n_objects: int,
         num_workers: int,
-        n_steps: int,
-        dataset_class: str,
-        T: int,
         num_train_images: Optional[int] = None,
         num_val_images: Optional[int] = None,
     ):
@@ -74,31 +71,25 @@ class CLEVRDataModule(pl.LightningDataModule):
         self.train_batch_size = train_batch_size
         self.val_batch_size = val_batch_size
         self.clevr_transforms = clevr_transforms
+        self.max_n_objects = max_n_objects
         self.num_workers = num_workers
         self.num_train_images = num_train_images
         self.num_val_images = num_val_images
-        self.n_steps= n_steps
-        self.dataset_class = dataset_class
-        self.T = T
 
-        self.train_dataset = SyntheticDataset(
+        self.train_dataset = CLEVRDataset(
             data_root=self.data_root,
             max_num_images=self.num_train_images,
             clevr_transforms=self.clevr_transforms,
             split="train",
-            n_steps = self.n_steps,
-            dataset_class=self.dataset_class, 
-            T=self.T
-          )
-        self.val_dataset = SyntheticDataset(
+            max_n_objects=self.max_n_objects,
+        )
+        self.val_dataset = CLEVRDataset(
             data_root=self.data_root,
             max_num_images=self.num_val_images,
             clevr_transforms=self.clevr_transforms,
             split="val",
-            n_steps = self.n_steps,
-            dataset_class=self.dataset_class, 
-            T=self.T
-            )
+            max_n_objects=self.max_n_objects,
+        )
 
     def train_dataloader(self):
         return DataLoader(
@@ -106,6 +97,7 @@ class CLEVRDataModule(pl.LightningDataModule):
             batch_size=self.train_batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -114,18 +106,19 @@ class CLEVRDataModule(pl.LightningDataModule):
             batch_size=self.val_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            pin_memory=True,
         )
 
-# This is not being used, actual ones being used are in train.py
+
 class CLEVRTransforms(object):
-    def _init_(self, resolution: Tuple[int, int]):
+    def __init__(self, resolution: Tuple[int, int]):
         self.transforms = transforms.Compose(
             [
                 transforms.ToTensor(),
-                #transforms.Lambda(lambda X: 2 * X - 1.0),  # rescale between -1 and 1
+                transforms.Lambda(lambda X: 2 * X - 1.0),  # rescale between -1 and 1
                 transforms.Resize(resolution),
             ]
         )
 
-    def _call_(self, input, *args, **kwargs):
+    def __call__(self, input, *args, **kwargs):
         return self.transforms(input)

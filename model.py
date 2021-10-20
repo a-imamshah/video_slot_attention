@@ -9,7 +9,6 @@ from utils import assert_shape
 from utils import build_grid
 from utils import conv_transpose_out_shape
 
-#from lpips.lpips import LPIPS
 
 class SlotAttention(nn.Module):
     def __init__(self, in_features, num_iterations, num_slots, slot_size, mlp_hidden_size, epsilon=1e-8):
@@ -50,7 +49,6 @@ class SlotAttention(nn.Module):
 
     def forward(self, inputs: Tensor, slots):
         # `inputs` has shape [batch_size, num_inputs, inputs_size].
-        # `encoder_out` has shape: [batch_size, height*width, filter_size]
         batch_size, num_inputs, inputs_size = inputs.shape
         inputs = self.norm_inputs(inputs)  # Apply layer norm to the input.
         k = self.project_k(inputs)  # Shape: [batch_size, num_inputs, slot_size].
@@ -66,7 +64,6 @@ class SlotAttention(nn.Module):
         # Multiple rounds of attention.
         for _ in range(self.num_iterations):
             slots_prev = slots
-            #print(slots.shape)
             slots = self.norm_slots(slots)
 
             # Attention.
@@ -109,8 +106,8 @@ class SlotAttentionModel(nn.Module):
         in_channels: int = 3,
         kernel_size: int = 5,
         slot_size: int = 64,
-        hidden_dims: Tuple[int, ...] = (128, 128, 64, 64),
-        decoder_resolution: Tuple[int, int] = (4, 4),
+        hidden_dims: Tuple[int, ...] = (64, 64, 64, 64),
+        decoder_resolution: Tuple[int, int] = (8, 8),
         empty_cache=False,
     ):
         super().__init__()
@@ -124,7 +121,6 @@ class SlotAttentionModel(nn.Module):
         self.hidden_dims = hidden_dims
         self.decoder_resolution = decoder_resolution
         self.out_features = self.hidden_dims[-1]
-        #.to(self.device)
 
         modules = []
         channels = self.in_channels
@@ -204,25 +200,25 @@ class SlotAttentionModel(nn.Module):
             mlp_hidden_size=128,
         )
 
-    def forward(self, x_all):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        x_all.to(device=device, dtype=torch.float)
-        #print(x_all.shape)
+    def forward(self, batch):
         if self.empty_cache:
             torch.cuda.empty_cache()
-        
-        batch_size, frames, num_channels, height, width = x_all.shape
-        
-        # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
-        slots_init = torch.randn((batch_size, self.num_slots, self.slot_size)).cuda()
-        
-        slots = self.slot_attention.slots_mu + self.slot_attention.slots_log_sigma.exp() * slots_init
-        slots_prev = slots
-        recon_combined, recons_all, masks_all, slots_all = [], [], [], []
-        for i in range(frames):
 
-            
-            x = x_all[:,i,:,:,:]
+        batch_size, nFrames, num_channels, height, width = batch.shape
+        outs = []
+
+
+        ####################################################################################################
+        # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
+        slots_init = torch.randn((batch_size, self.num_slots, self.slot_size))
+        slots_init = torch.randn((batch_size, self.num_slots, self.slot_size)).cuda()
+        slots = self.slot_attention.slots_mu + self.slot_attention.slots_log_sigma.exp() * slots_init
+
+        prev_slot = slots
+        ###################################################################################################
+
+        for i in range(nFrames):
+            x = batch[:,i,:,:,:]
             encoder_out = self.encoder(x)
             encoder_out = self.encoder_pos_embedding(encoder_out)
             # `encoder_out` has shape: [batch_size, filter_size, height, width]
@@ -232,37 +228,35 @@ class SlotAttentionModel(nn.Module):
             encoder_out = self.encoder_out_layer(encoder_out)
             # `encoder_out` has shape: [batch_size, height*width, filter_size]
 
-            slots_prev = slots_prev.type_as(encoder_out)
-    
-            slots = self.slot_attention(encoder_out, slots_prev)
+            slots = self.slot_attention(encoder_out, prev_slot)
             assert_shape(slots.size(), (batch_size, self.num_slots, self.slot_size))
-            slots_prev = slots
+
+
+            ##################
+            prev_slot = slots
+            #####################
+
+
+
             # `slots` has shape: [batch_size, num_slots, slot_size].
             batch_size, num_slots, slot_size = slots.shape
 
             slots = slots.view(batch_size * num_slots, slot_size, 1, 1)
-            slots_all.append(slots)
-            
             decoder_in = slots.repeat(1, 1, self.decoder_resolution[0], self.decoder_resolution[1])
-    
+
             out = self.decoder_pos_embedding(decoder_in)
             out = self.decoder(out)
-            # `out` has shape: [batch_size*num_slots, num_channels+1, height, width].
-            assert_shape(out.size(), (batch_size * num_slots, num_channels + 1, height, width))
+            outs.append(out)
+        out = torch.stack(outs, dim = 1)
 
-            out = out.view(batch_size, num_slots, num_channels + 1, height, width)
-            recons = out[:, :, :num_channels, :, :]
-            recons_all.append(recons)
-            masks = out[:, :, -1:, :, :]
-            masks = F.softmax(masks, dim=1)
-            masks_all.append(masks)
-            recon_combined.append(torch.sum(recons * masks, dim=1))
-            
-        recon_combined = torch.stack(recon_combined, dim=1)
-        recons = torch.stack(recons_all, dim=2)
-        masks = torch.stack(masks_all, dim=2)
-        slots = torch.stack(slots_all, dim=1)
-        
+        # `out` has shape: [batch_size*num_slots, num_channels+1, height, width].
+        assert_shape(out.size(), (batch_size * num_slots, nFrames, num_channels + 1, height, width))
+
+        out = out.view(batch_size, num_slots, nFrames, num_channels + 1, height, width)
+        recons = out[:, :, :, :num_channels, :, :]
+        masks = out[:, :, :, -1:, :, :]
+        masks = F.softmax(masks, dim=1)
+        recon_combined = torch.sum(recons * masks, dim=1)
         return recon_combined, recons, masks, slots
 
     def loss_function(self, input):
