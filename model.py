@@ -21,18 +21,34 @@ class SlotAttention(nn.Module):
         self.epsilon = epsilon
 
         self.norm_inputs = nn.LayerNorm(self.in_features)
+        self.norm_mem_slots = nn.LayerNorm(self.in_features)
         # I guess this is layer norm across each slot? should look into this
         self.norm_slots = nn.LayerNorm(self.slot_size)
         self.norm_mlp = nn.LayerNorm(self.slot_size)
 
         # Linear maps for the attention module.
         self.project_q = nn.Linear(self.slot_size, self.slot_size, bias=False)
-        self.project_k = nn.Linear(self.slot_size, self.slot_size, bias=False)
-        self.project_v = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        self.project_k1 = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        self.project_v1 = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        # Linear maps for the memory attention module.
+        self.project_k2 = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        self.project_v2 = nn.Linear(self.slot_size, self.slot_size, bias=False)
+
+        self.mlp_i = nn.Sequential(
+            nn.Linear(self.slot_size*2, self.mlp_hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_size, self.slot_size),
+        )
 
         # Slot update functions.
         self.gru = nn.GRUCell(self.slot_size, self.slot_size)
         self.mlp = nn.Sequential(
+            nn.Linear(self.slot_size, self.mlp_hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.mlp_hidden_size, self.slot_size),
+        )
+
+        self.mlp_m = nn.Sequential(
             nn.Linear(self.slot_size, self.mlp_hidden_size),
             nn.ReLU(),
             nn.Linear(self.mlp_hidden_size, self.slot_size),
@@ -47,54 +63,115 @@ class SlotAttention(nn.Module):
             nn.init.xavier_uniform_(torch.zeros((1, 1, self.slot_size)), gain=nn.init.calculate_gain("linear")),
         )
 
-    def forward(self, inputs: Tensor, slots):
+        self.register_buffer(
+            "mem_slots_mu",
+            nn.init.xavier_uniform_(torch.zeros((1, 1, self.slot_size)), gain=nn.init.calculate_gain("linear")),
+        )
+        self.register_buffer(
+            "mem_slots_log_sigma",
+            nn.init.xavier_uniform_(torch.zeros((1, 1, self.slot_size)), gain=nn.init.calculate_gain("linear")),
+        )
+
+        # Linear maps for the attention module.
+        self.project_qm = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        self.project_km = nn.Linear(self.slot_size, self.slot_size, bias=False)
+        self.project_vm = nn.Linear(self.slot_size, self.slot_size, bias=False)
+
+    def forward(self, inputs: Tensor, memory_slots, instant_slots):
         # `inputs` has shape [batch_size, num_inputs, inputs_size].
         batch_size, num_inputs, inputs_size = inputs.shape
         inputs = self.norm_inputs(inputs)  # Apply layer norm to the input.
-        k = self.project_k(inputs)  # Shape: [batch_size, num_inputs, slot_size].
-        assert_shape(k.size(), (batch_size, num_inputs, self.slot_size))
-        v = self.project_v(inputs)  # Shape: [batch_size, num_inputs, slot_size].
-        assert_shape(v.size(), (batch_size, num_inputs, self.slot_size))
 
-        # # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
-        # slots_init = torch.randn((batch_size, self.num_slots, self.slot_size))
-        # slots_init = slots_init.type_as(inputs)
-        # slots = self.slots_mu + self.slots_log_sigma.exp() * slots_init
+        batch_size, num_mem_slots, mem_slot_size = memory_slots.shape
+        memory_slots = self.norm_mem_slots(memory_slots)  # Apply layer norm to the input.
+        
+        k1 = self.project_k1(inputs)  # Shape: [batch_size, num_inputs, slot_size].
+        assert_shape(k1.size(), (batch_size, num_inputs, self.slot_size))
+        v1 = self.project_v1(inputs)  # Shape: [batch_size, num_inputs, slot_size].
+        assert_shape(v1.size(), (batch_size, num_inputs, self.slot_size))
+
+        k2 = self.project_k2(memory_slots)  # Shape: [batch_size, num_inputs, slot_size].
+        assert_shape(k2.size(), (batch_size, num_mem_slots, self.slot_size))
+        v2 = self.project_v2(memory_slots)  # Shape: [batch_size, num_inputs, slot_size].
+        assert_shape(v2.size(), (batch_size, num_mem_slots, self.slot_size))
 
         # Multiple rounds of attention.
         for _ in range(self.num_iterations):
-            slots_prev = slots
-            slots = self.norm_slots(slots)
+            slots_prev = instant_slots
+            instant_slots = self.norm_slots(instant_slots)
 
             # Attention.
-            q = self.project_q(slots)  # Shape: [batch_size, num_slots, slot_size].
+            q = self.project_q(instant_slots)  # Shape: [batch_size, num_slots, slot_size].
             assert_shape(q.size(), (batch_size, self.num_slots, self.slot_size))
 
             attn_norm_factor = self.slot_size ** -0.5
-            attn_logits = attn_norm_factor * torch.matmul(k, q.transpose(2, 1))
-            attn = F.softmax(attn_logits, dim=-1)
+
+            ############### Attention on Input Features ######################################
+            attn_logits1 = attn_norm_factor * torch.matmul(k1, q.transpose(2, 1))
+            attn1 = F.softmax(attn_logits1, dim=-1)
             # `attn` has shape: [batch_size, num_inputs, num_slots].
-            assert_shape(attn.size(), (batch_size, num_inputs, self.num_slots))
+            assert_shape(attn1.size(), (batch_size, num_inputs, self.num_slots))
 
             # Weighted mean.
-            attn = attn + self.epsilon
-            attn = attn / torch.sum(attn, dim=1, keepdim=True)
-            updates = torch.matmul(attn.transpose(1, 2), v)
+            attn1 = attn1 + self.epsilon
+            attn1 = attn1 / torch.sum(attn1, dim=1, keepdim=True)
+            updates1 = torch.matmul(attn1.transpose(1, 2), v1)
             # `updates` has shape: [batch_size, num_slots, slot_size].
-            assert_shape(updates.size(), (batch_size, self.num_slots, self.slot_size))
+            assert_shape(updates1.size(), (batch_size, self.num_slots, self.slot_size))
+            #################################################################################
+
+            ############### Attention on Memory Slots ########################################
+            attn_logits2 = attn_norm_factor * torch.matmul(k2, q.transpose(2, 1))
+            attn2 = F.softmax(attn_logits2, dim=-1)
+            # `attn` has shape: [batch_size, num_inputs, num_slots].
+            assert_shape(attn1.size(), (batch_size, num_inputs, self.num_slots))
+
+            # Weighted mean.
+            attn2 = attn2 + self.epsilon
+            attn2 = attn2 / torch.sum(attn2, dim=1, keepdim=True)
+            updates2 = torch.matmul(attn2.transpose(1, 2), v2)
+            # `updates` has shape: [batch_size, num_slots, slot_size].
+            assert_shape(updates2.size(), (batch_size, self.num_slots, self.slot_size))
+            #################################################################################
+
+            updates = self.mlp_i(torch.cat((updates1, updates2), dim=-1))
 
             # Slot update.
             # GRU is expecting inputs of size (N,H) so flatten batch and slots dimension
-            slots = self.gru(
+            instant_slots = self.gru(
                 updates.view(batch_size * self.num_slots, self.slot_size),
                 slots_prev.view(batch_size * self.num_slots, self.slot_size),
             )
-            slots = slots.view(batch_size, self.num_slots, self.slot_size)
-            assert_shape(slots.size(), (batch_size, self.num_slots, self.slot_size))
-            slots = slots + self.mlp(self.norm_mlp(slots))
-            assert_shape(slots.size(), (batch_size, self.num_slots, self.slot_size))
+            instant_slots = instant_slots.view(batch_size, self.num_slots, self.slot_size)
+            assert_shape(instant_slots.size(), (batch_size, self.num_slots, self.slot_size))
+            instant_slots = instant_slots + self.mlp(self.norm_mlp(instant_slots))
+            assert_shape(instant_slots.size(), (batch_size, self.num_slots, self.slot_size))
 
-        return slots
+        ############### Updating on Memory Slots with Attention ##########################
+
+        km = self.project_km(instant_slots)  # Shape: [batch_size, num_slots, slot_size].
+        assert_shape(km.size(), (batch_size, self.num_slots, self.slot_size))
+        vm = self.project_vm(instant_slots)  # Shape: [batch_size, num_slots, slot_size].
+        assert_shape(vm.size(), (batch_size, self.num_slots, self.slot_size))
+        qm = self.project_qm(memory_slots)  # Shape: [batch_size, num_mem_slots, slot_size].
+        assert_shape(qm.size(), (batch_size, num_mem_slots, self.slot_size))
+
+        attn_logitsm = attn_norm_factor * torch.matmul(qm, km.transpose(2, 1))
+        attnm = F.softmax(attn_logitsm, dim=-1)
+        # `attn` has shape: [batch_size, num_inputs, num_slots].
+        assert_shape(attnm.size(), (batch_size, num_mem_slots, self.num_slots))
+
+        # Weighted mean.
+        attnm = attnm + self.epsilon
+        attnm = attnm / torch.sum(attnm, dim=1, keepdim=True)
+        updatesm = torch.matmul(attnm, vm)
+        # `updates` has shape: [batch_size, num_slots, slot_size].
+        assert_shape(updatesm.size(), (batch_size, num_mem_slots, self.slot_size))
+
+        memory_slots = memory_slots + self.mlp_m(updatesm)
+        #################################################################################
+
+        return memory_slots, instant_slots
 
 
 class SlotAttentionModel(nn.Module):
@@ -107,12 +184,13 @@ class SlotAttentionModel(nn.Module):
         kernel_size: int = 5,
         slot_size: int = 64,
         hidden_dims: Tuple[int, ...] = (64, 64, 64, 64),
-        decoder_resolution: Tuple[int, int] = (8, 8),
+        decoder_resolution: Tuple[int, int] = (4, 4),
         empty_cache=False,
     ):
         super().__init__()
         self.resolution = resolution
         self.num_slots = num_slots
+        self.num_mem_slots = 15
         self.num_iterations = num_iterations
         self.in_channels = in_channels
         self.kernel_size = kernel_size
@@ -210,14 +288,17 @@ class SlotAttentionModel(nn.Module):
 
         ####################################################################################################
         # Initialize the slots. Shape: [batch_size, num_slots, slot_size].
-        slots_init = torch.randn((batch_size, self.num_slots, self.slot_size))
-        slots_init = torch.randn((batch_size, self.num_slots, self.slot_size)).cuda()
-        slots = self.slot_attention.slots_mu + self.slot_attention.slots_log_sigma.exp() * slots_init
+        slots = torch.randn((batch_size, self.num_slots, self.slot_size)).cuda()
+        slots = self.slot_attention.slots_mu + self.slot_attention.slots_log_sigma.exp() * slots
+
+        memory_slots = torch.randn((batch_size, self.num_mem_slots, self.slot_size)).cuda()
+        memory_slots = self.slot_attention.mem_slots_mu + self.slot_attention.mem_slots_log_sigma.exp() * memory_slots
 
         prev_slot = slots
         ###################################################################################################
 
         for i in range(nFrames):
+        
             x = batch[:,i,:,:,:]
             encoder_out = self.encoder(x)
             encoder_out = self.encoder_pos_embedding(encoder_out)
@@ -228,7 +309,7 @@ class SlotAttentionModel(nn.Module):
             encoder_out = self.encoder_out_layer(encoder_out)
             # `encoder_out` has shape: [batch_size, height*width, filter_size]
 
-            slots = self.slot_attention(encoder_out, prev_slot)
+            memory_slots, slots = self.slot_attention(encoder_out, memory_slots, prev_slot)
             assert_shape(slots.size(), (batch_size, self.num_slots, self.slot_size))
 
 
